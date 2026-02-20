@@ -1,49 +1,128 @@
----
-  name: Solar System Workflow
-  on:
-    workflow_dispatch: null
-    push:
-      branches:
-        - main
-        - feature/*
-  env:
-    MONGO_URI: mongodb+srv://supercluster.d83jj.mongodb.net/superData
-    MONGO_USERNAME: superuser
-    MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
-  jobs:
-    unit-testing:
-      name: Unit Testing
-      runs-on: ubuntu-latest
-      steps:
-        - name: Checkout Repository
-          uses: actions/checkout@v4
-        - name: Setup NodeJS Version
-          uses: actions/setup-node@v4
-          with:
-            node-version: 20
-        - name: Install Dependencies
-          run: npm install
-        - name: Unit Testing
-          run: npm test
-        - name: Archive Test Result
-          uses: actions/upload-artifact@v4
-          with:
-            name: Mocha-Test-Result
-            path: test-results.xml
+name: Solar System Workflow
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - 'feature/*'
+env:
+  MONGO_URI: 'mongodb+srv://supercluster.d83jj.mongodb.net/superData'
+  MONGO_USERNAME: ${{ vars.MONGO_USERNAME }}
+  MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
 
-    code-coverage:
-       runs-on: ubuntu-latest
-       steps:
-       - uses: actions/checkout@v4
-       - uses: actions/setup-node@v4
-         with:
+jobs:
+  unit-testing:
+    name: Unit Testing
+    strategy:
+      matrix:
+        nodejs_version: [18, 19, 20]
+        operating_system: [ubuntu-latest, macos-latest]
+      exclude:
+        - nodejs_version: 18
+          operating_system: macos-latest
+    runs-on: ${{ matrix.operating_system }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.nodejs_version }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ matrix.nodejs_version }}
+
+      - name: Cache NPM dependencies
+        uses: actions/cache@v3
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-modules-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Run Unit Tests
+        run: npm test
+
+      - name: Archive Test Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: Unit-Test-Results
+          path: test-results
+          retention-days: 5
+
+  code-coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 18
+        uses: actions/setup-node@v3
+        with:
           node-version: 18
-       - run: npm install
-       - continue-on-error: true
-         run: npm run coverage
-       - uses: actions/upload-artifact@v4
-         with:
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Check Code Coverage
+        continue-on-error: true
+        run: npm run coverage
+
+      - name: Archive Coverage Report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
           name: Code-Coverage-Result
           path: coverage
           retention-days: 5
-  
+
+  containerization:
+    permissions:
+      packages: write
+    name: Containerization
+    runs-on: ubuntu-latest
+    needs: [unit-testing, code-coverage]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: GHCR Login
+        uses: docker/login-action@v2.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+    
+      - name: Build Docker Image for Testing
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: false
+          tags: ${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha }}
+
+      - name: Docker Image Testing
+        run: |
+          # List built images
+          docker images
+
+          # Run the container in detached mode
+          docker run --name solar-system-app -d \
+            -p 3000:3000 \
+            -e MONGO_URI=$MONGO_URI \
+            -e MONGO_USERNAME=$MONGO_USERNAME \
+            -e MONGO_PASSWORD=$MONGO_PASSWORD \
+            ${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha }}
+
+          # Display container IP address
+          echo "Container IP:" $(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' solar-system-app)
+
+          # Test the /live endpoint
+          echo "Testing /live endpoint"
+          wget -q -O - http://127.0.0.1:3000/live | grep live
+    
+      - name: Docker Push
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true                    # enable push to registry
+          tags: ${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha }}
